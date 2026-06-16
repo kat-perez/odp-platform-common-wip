@@ -3,16 +3,16 @@
 //! EFI_RAM_DISK_PROTOCOL, and chainload \EFI\Boot\bootx64.efi from the
 //! resulting FAT volume.
 //!
-//! Hotkey detection uses MS_BUTTON_SERVICES_PROTOCOL (Surface platforms
-//! publish this via the SAM button driver). The Vol-Up + Power chord at
-//! power-on selects the SRE path; absence falls through to the normal
-//! boot orchestration.
+//! Hotkey detection uses MS_BUTTON_SERVICES_PROTOCOL (platforms publishing
+//! it latch button state via a vendor controller/EC). The Vol-Up + Power
+//! chord at power-on selects the SRE path; absence falls through to the
+//! normal boot orchestration.
 //!
 //! This module inlines FFI for three protocols rather than depending on
 //! helpers that may not be published yet:
 //!   - EFI_NVM_EXPRESS_PASS_THRU_PROTOCOL (for Identify + Get Log Page)
 //!   - EFI_RAM_DISK_PROTOCOL (UEFI 2.5+)
-//!   - MS_BUTTON_SERVICES_PROTOCOL (Surface/Microsoft)
+//!   - MS_BUTTON_SERVICES_PROTOCOL
 //!
 //! ## License
 //!
@@ -162,7 +162,7 @@ mod ram_disk {
     }
 }
 
-/// MS_BUTTON_SERVICES_PROTOCOL FFI (Surface platform button service).
+/// MS_BUTTON_SERVICES_PROTOCOL FFI (platform button service).
 mod button_services {
     use core::ffi::c_void;
     use r_efi::efi;
@@ -181,7 +181,7 @@ mod button_services {
         pub pre_boot_volume_up_check: ButtonCheckFn,
         pub pre_boot_volume_down_check: ButtonCheckFn,
         pub pre_boot_clear_state: ClearStateFn,
-        // Surface adds more entries; we only need these three.
+        // Producers may add more entries; we only need these three.
         pub _reserved: *mut c_void,
     }
 }
@@ -189,7 +189,7 @@ mod button_services {
 /// Returns `true` if the Vol-Up + Power chord was registered at power-on.
 ///
 /// Reads via MS_BUTTON_SERVICES_PROTOCOL. Returns `false` if the protocol is
-/// absent (platform doesn't publish a SAM button service).
+/// absent (platform doesn't publish a button-services producer).
 pub fn detect_sre_hotkey<B: BootServices>(boot_services: &B) -> bool {
     // SAFETY: dereferencing the returned interface only via raw pointer calls below.
     let protocol = match unsafe {
@@ -521,6 +521,45 @@ pub fn run_sre_flow<B: BootServices>(
     core::mem::forget(_leaked);
 
     chainload_from_ramdisk(boot_services, image_handle, ram_dp)
+}
+
+/// True if BP1 contains the WIM file magic `MSWIM\0\0\0` at offset 0,
+/// indicating an SRE WIM has been committed via Firmware Image Download.
+///
+/// Used by the SreBootManager fallback path to decide between "boot SRE
+/// from BP1" and "give up" when normal boot has exhausted all options
+/// (or when a USB Boot#### entry would just re-run the flashing tool
+/// that put the WIM there).
+///
+/// Returns `false` on any error (no NvmExpressPassThru protocol, BP1
+/// inaccessible, magic mismatch). Caller should treat as "no SRE WIM
+/// present, fall through to default failure handling".
+///
+/// Cost: one 512-byte LID 0x15 head read of BP1.
+pub fn bp_has_valid_sre_wim<B: BootServices>(boot_services: &B) -> bool {
+    helpers::connect_all(boot_services).ok();
+
+    // SAFETY: dereferencing the returned interface only via raw pointer calls below.
+    let passthru = match unsafe {
+        boot_services.locate_protocol_unchecked(&nvme_pass_thru::PROTOCOL_GUID, ptr::null_mut())
+    } {
+        Ok(p) => p as *mut nvme_pass_thru::Protocol,
+        Err(e) => {
+            log::warn!("bp_has_valid_sre_wim: NvmExpressPassThru not available: {:?}", e);
+            return false;
+        }
+    };
+
+    let mut head = [0u8; 512];
+    if let Err(e) = read_bp_via_log_page(passthru, TARGET_BPID, head.len(), &mut head) {
+        log::warn!("bp_has_valid_sre_wim: BP1 head read failed: {:?}", e);
+        return false;
+    }
+
+    // WIM file format: first 8 bytes are `MSWIM\0\0\0` (WIM_HEADER.ImageTag).
+    let has_magic = &head[..8] == b"MSWIM\0\0\0";
+    log::info!("bp_has_valid_sre_wim: WIM magic match = {}", has_magic);
+    has_magic
 }
 
 #[cfg(test)]

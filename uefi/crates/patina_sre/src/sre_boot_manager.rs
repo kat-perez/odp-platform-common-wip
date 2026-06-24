@@ -202,7 +202,9 @@ fn interleave_connect_and_dispatch<B: BootServices, D: DxeDispatch + ?Sized>(
     boot_services: &B,
     dxe_services: &D,
 ) -> patina::error::Result<()> {
-    const MAX_ROUNDS: usize = 10;
+    // Isolation test: drop from 10 to 1 to verify the multi-round connect_all
+    // is what's leaving the PTL I2C5 HID controller stuck on Maa.
+    const MAX_ROUNDS: usize = 1;
 
     for _round in 0..MAX_ROUNDS {
         helpers::connect_all(boot_services)?;

@@ -21,6 +21,10 @@ keywords = ["uefi", "edk2", "tianocore", "patina", "firmware"]
 categories = ["embedded", "no-std"]
 readme = "README.md"
 
+# Not published to crates.io. The 0.1.0 release was yanked; this crate is
+# developed in-tree only.
+publish = false
+
 [dependencies]
 log = { version = "0.4", default-features = false }
 r-efi = { version = "5.0.0", default-features = false }

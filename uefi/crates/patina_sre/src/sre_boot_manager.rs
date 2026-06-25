@@ -523,16 +523,20 @@ impl BootOrchestrator for SreBootManager {
             }
         }
 
-        // HARDCODED-BOOT TEST: also stripped out the bp_recovery BP1 SRE
-        // WIM probe + the USB-filter-on-Boot#### logic. Goes straight to
-        // Boot#### enumeration. NVMe LID reads are on PCIe (not I2C5) so
-        // safe in principle, but every extra protocol call before Windows
-        // boot is a thing to bisect later if lag persists.
+        // Iterate Boot#### options from NVRAM. For each, do a TARGETED
+        // connect via helpers::connect_device_path (mirrors EDK2's
+        // EfiBootManagerConnectDevicePath) — binds only the controllers
+        // along the boot path (e.g., NVMe -> PartitionDxe -> FAT), without
+        // touching unrelated controllers (e.g., I2C5 HID) the way
+        // helpers::connect_all does.
         let mut tried_any = false;
         match helpers::discover_boot_options(runtime_services) {
             Ok(boot_config) => {
                 for device_path in boot_config.devices() {
                     tried_any = true;
+                    if let Err(e) = helpers::connect_device_path(boot_services, device_path) {
+                        log::warn!("connect_device_path failed (path={:?}): {:?}", device_path, e);
+                    }
                     if let Err(e) = helpers::signal_ready_to_boot(boot_services) {
                         log::error!("signal_ready_to_boot failed: {:?}", e);
                     }
@@ -548,6 +552,9 @@ impl BootOrchestrator for SreBootManager {
         if !tried_any {
             // Discovery returned no entries or errored — fall back to the
             // constructor-provided path.
+            if let Err(e) = helpers::connect_device_path(boot_services, &self.main_os_path) {
+                log::warn!("connect_device_path (fallback) failed: {:?}", e);
+            }
             if let Err(e) = helpers::signal_ready_to_boot(boot_services) {
                 log::error!("signal_ready_to_boot failed: {:?}", e);
             }

@@ -432,25 +432,31 @@ impl BootOrchestrator for SreBootManager {
         dxe_dispatch: &dyn DxeDispatch,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
-        // BDS sequence mirroring what C BdsDxe does before EndOfDxe, so
-        // platform handlers that key off EndOfDxe (e.g., MU SemmManager
-        // checking DfciUiIsUiAvailable -> gMsSWMProtocolGuid) find the
-        // dependencies they need.
+        // BDS sequence mirroring C BdsDxe + PlatformBootManagerLib on
+        // Maa, so platform EndOfDxe handlers (MU SemmManager checking
+        // DfciUiIsUiAvailable -> gMsSWMProtocolGuid) find what they need.
         //
-        //   1. Connect default consoles (Graphics + ConOut + ConIn)
-        //      so SimpleWindowManager + console splitter come up. Without
-        //      this, SemmManager's EndOfDxe callback hits its
-        //      "UI not available" ASSERT and the boot path bails.
-        //   2. Connect storage (NVMe Pass-Thru) so the namespace driver
-        //      binds -> BlockIo -> PartitionDxe -> HD child handles
-        //      appear. Without this, expand_device_path on partial
-        //      Boot#### paths fails and we loop trying every entry.
-        //   3. Signal EndOfDxe (security lockdown).
+        //   1. Bootstrap PCI topology via ConnectRootBridge(FALSE).
+        //      PciBus enumerates the bus and creates handles for every
+        //      PCI device (display, NVMe, USB...). Without this all the
+        //      targeted-connect calls below are no-ops because their
+        //      target handles don't exist yet.
+        //   2. Connect default consoles so SimpleWindowManager publishes
+        //      gMsSWMProtocolGuid -> SemmManager's UI check passes at
+        //      EndOfDxe.
+        //   3. Connect NVMe -> namespace driver -> BlockIo ->
+        //      PartitionDxe -> HD child handles -> expand_device_path
+        //      finds the boot partition.
+        //   4. Signal EndOfDxe (security lockdown).
         //
-        // We intentionally avoid helpers::connect_all here — that one
-        // re-Start()s every driver binding, and the PTL I2C5 HID binding
-        // isn't idempotent (disable-poll race leaves the bus stuck,
-        // surfacing as OS keyboard lag).
+        // Intentionally avoiding helpers::connect_all — it re-Start()s
+        // every driver binding, and the PTL I2C5 HID binding isn't
+        // idempotent (disable-poll race leaves bus stuck -> OS keyboard
+        // lag).
+        if let Err(e) = helpers::connect_pci_root_bridges(boot_services) {
+            log::warn!("connect_pci_root_bridges failed: {:?}", e);
+        }
+
         if let Err(e) = helpers::connect_default_consoles(boot_services) {
             log::warn!("connect_default_consoles failed: {:?}", e);
         }

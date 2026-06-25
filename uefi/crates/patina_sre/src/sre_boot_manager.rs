@@ -523,6 +523,20 @@ impl BootOrchestrator for SreBootManager {
             }
         }
 
+        // Bring up storage so PartitionDxe enumerates HD children before
+        // we look up the boot path. Boot#### entries are stored as PARTIAL
+        // paths (HD(GPT,GUID,...)/FilePath); expand_device_path needs HD
+        // handles to already exist in the topology to resolve the partition
+        // signature. NvmePassThru is the controller-level protocol on NVMe
+        // host controllers — connecting them triggers the namespace driver
+        // -> BlockIo -> PartitionDxe cascade, without touching I2C / serial
+        // / USB controllers.
+        const NVME_PASS_THRU_PROTOCOL_GUID: efi::Guid =
+            efi::Guid::from_fields(0x52c78312, 0x8edc, 0x4233, 0x98, 0xf2, &[0x1a, 0x1a, 0xa5, 0xe3, 0x88, 0xa5]);
+        if let Err(e) = helpers::connect_handles_by_protocol(boot_services, &NVME_PASS_THRU_PROTOCOL_GUID) {
+            log::warn!("connect_handles_by_protocol(NvmePassThru) failed: {:?}", e);
+        }
+
         // Iterate Boot#### options from NVRAM. For each, do a TARGETED
         // connect via helpers::connect_device_path (mirrors EDK2's
         // EfiBootManagerConnectDevicePath) — binds only the controllers

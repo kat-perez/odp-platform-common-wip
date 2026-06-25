@@ -432,21 +432,35 @@ impl BootOrchestrator for SreBootManager {
         dxe_dispatch: &dyn DxeDispatch,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
-        // HARDCODED-BOOT TEST PATH (I2C5 lag isolation, 2026-06-25):
-        // Strip the full BDS service ladder down to the absolute minimum so
-        // we can flash a Patina-driven BDS that doesn't disturb the Maa I2C5
-        // HID controller mid-state. Removed for this test:
-        //   * interleave_connect_and_dispatch + post-loop connect_all
-        //     (these re-Start() driver bindings; PTL I2C5 binding isn't
-        //     idempotent and ends up in a disable-poll race -> stuck bus
-        //     -> OS keyboard lag)
-        //   * discover_console_devices (binds keyboard HID over I2C5)
-        //   * gMsStartOfBdsNotifyGuid + gDfciStartOfBdsNotifyGuid signals
-        //     (driver callbacks on these may also touch I2C5)
-        // We keep ONLY signal_bds_phase_entry (EndOfDxe security lockdown
-        // is mandatory) and the hotkey-routed direct LoadImage paths
-        // below. DXE dispatch already bound the filesystem driver we need
-        // to read the boot file off the ESP.
+        // BDS sequence mirroring what C BdsDxe does before EndOfDxe, so
+        // platform handlers that key off EndOfDxe (e.g., MU SemmManager
+        // checking DfciUiIsUiAvailable -> gMsSWMProtocolGuid) find the
+        // dependencies they need.
+        //
+        //   1. Connect default consoles (Graphics + ConOut + ConIn)
+        //      so SimpleWindowManager + console splitter come up. Without
+        //      this, SemmManager's EndOfDxe callback hits its
+        //      "UI not available" ASSERT and the boot path bails.
+        //   2. Connect storage (NVMe Pass-Thru) so the namespace driver
+        //      binds -> BlockIo -> PartitionDxe -> HD child handles
+        //      appear. Without this, expand_device_path on partial
+        //      Boot#### paths fails and we loop trying every entry.
+        //   3. Signal EndOfDxe (security lockdown).
+        //
+        // We intentionally avoid helpers::connect_all here — that one
+        // re-Start()s every driver binding, and the PTL I2C5 HID binding
+        // isn't idempotent (disable-poll race leaves the bus stuck,
+        // surfacing as OS keyboard lag).
+        if let Err(e) = helpers::connect_default_consoles(boot_services) {
+            log::warn!("connect_default_consoles failed: {:?}", e);
+        }
+
+        const NVME_PASS_THRU_PROTOCOL_GUID: efi::Guid =
+            efi::Guid::from_fields(0x52c78312, 0x8edc, 0x4233, 0x98, 0xf2, &[0x1a, 0x1a, 0xa5, 0xe3, 0x88, 0xa5]);
+        if let Err(e) = helpers::connect_handles_by_protocol(boot_services, &NVME_PASS_THRU_PROTOCOL_GUID) {
+            log::warn!("connect_handles_by_protocol(NvmePassThru) failed: {:?}", e);
+        }
+
         if let Err(e) = helpers::signal_bds_phase_entry(boot_services) {
             log::error!("signal_bds_phase_entry failed: {:?}", e);
         }
@@ -523,26 +537,12 @@ impl BootOrchestrator for SreBootManager {
             }
         }
 
-        // Bring up storage so PartitionDxe enumerates HD children before
-        // we look up the boot path. Boot#### entries are stored as PARTIAL
-        // paths (HD(GPT,GUID,...)/FilePath); expand_device_path needs HD
-        // handles to already exist in the topology to resolve the partition
-        // signature. NvmePassThru is the controller-level protocol on NVMe
-        // host controllers — connecting them triggers the namespace driver
-        // -> BlockIo -> PartitionDxe cascade, without touching I2C / serial
-        // / USB controllers.
-        const NVME_PASS_THRU_PROTOCOL_GUID: efi::Guid =
-            efi::Guid::from_fields(0x52c78312, 0x8edc, 0x4233, 0x98, 0xf2, &[0x1a, 0x1a, 0xa5, 0xe3, 0x88, 0xa5]);
-        if let Err(e) = helpers::connect_handles_by_protocol(boot_services, &NVME_PASS_THRU_PROTOCOL_GUID) {
-            log::warn!("connect_handles_by_protocol(NvmePassThru) failed: {:?}", e);
-        }
-
-        // Iterate Boot#### options from NVRAM. For each, do a TARGETED
-        // connect via helpers::connect_device_path (mirrors EDK2's
-        // EfiBootManagerConnectDevicePath) — binds only the controllers
-        // along the boot path (e.g., NVMe -> PartitionDxe -> FAT), without
-        // touching unrelated controllers (e.g., I2C5 HID) the way
-        // helpers::connect_all does.
+        // Iterate Boot#### options from NVRAM. NVMe + PartitionDxe were
+        // brought up at the top of execute(), so expand_device_path now
+        // finds the matching HD partition signature. For each option, do
+        // an additional TARGETED connect via helpers::connect_device_path
+        // (mirrors EDK2's EfiBootManagerConnectDevicePath) for any
+        // late-binding drivers along the specific path.
         let mut tried_any = false;
         match helpers::discover_boot_options(runtime_services) {
             Ok(boot_config) => {

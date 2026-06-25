@@ -432,48 +432,23 @@ impl BootOrchestrator for SreBootManager {
         dxe_dispatch: &dyn DxeDispatch,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
-        if let Err(e) = interleave_connect_and_dispatch(boot_services, dxe_dispatch) {
-            log::error!("interleave_connect_and_dispatch failed: {:?}", e);
-        }
-
-        // One last connect pass before EndOfDxe so PartitionDxe and similar
-        // driver bindings can run during the open window.
-        if let Err(e) = helpers::connect_all(boot_services) {
-            log::error!("connect_all (pre-EndOfDxe) failed: {:?}", e);
-        }
-
+        // HARDCODED-BOOT TEST PATH (I2C5 lag isolation, 2026-06-25):
+        // Strip the full BDS service ladder down to the absolute minimum so
+        // we can flash a Patina-driven BDS that doesn't disturb the Maa I2C5
+        // HID controller mid-state. Removed for this test:
+        //   * interleave_connect_and_dispatch + post-loop connect_all
+        //     (these re-Start() driver bindings; PTL I2C5 binding isn't
+        //     idempotent and ends up in a disable-poll race -> stuck bus
+        //     -> OS keyboard lag)
+        //   * discover_console_devices (binds keyboard HID over I2C5)
+        //   * gMsStartOfBdsNotifyGuid + gDfciStartOfBdsNotifyGuid signals
+        //     (driver callbacks on these may also touch I2C5)
+        // We keep ONLY signal_bds_phase_entry (EndOfDxe security lockdown
+        // is mandatory) and the hotkey-routed direct LoadImage paths
+        // below. DXE dispatch already bound the filesystem driver we need
+        // to read the boot file off the ESP.
         if let Err(e) = helpers::signal_bds_phase_entry(boot_services) {
             log::error!("signal_bds_phase_entry failed: {:?}", e);
-        }
-
-        // Signal the Microsoft start-of-BDS event group that the C BDS
-        // path fires. Boot-policy components in the Microsoft UEFI
-        // ecosystem (PcBdsPkg, Project MU) key off this for pre-boot
-        // work and it has no observed adverse effects in the Patina
-        // dispatch path.
-        if let Err(e) = signal_event_group(boot_services, &MS_START_OF_BDS_NOTIFY_GUID) {
-            log::error!("signal gMsStartOfBdsNotifyGuid failed: {:?}", e);
-        }
-
-        // Signal the DFCI start-of-BDS event so the MU SettingsManager DXE
-        // driver publishes gDfciSettingAccessProtocolGuid. Doing this here
-        // rather than as part of EndOfDxe processing keeps the resulting
-        // SettingAccess-install notify dispatch in a clean stack frame -
-        // SemmManager's SettingAccessCallback closes its own event from
-        // inside the callback, which would corrupt the EDK2 DxeCore notify
-        // iterator if fired while EndOfDxe were still iterating.
-        //
-        // Safe to signal because the upstream DfciManager is dispatch-order
-        // resilient: apply-protocol statics are populated via
-        // RegisterProtocolNotify (so they're non-NULL whenever
-        // ProcessMailBoxes runs), and ProcessMailBoxes has a top-of-function
-        // guard against re-entry after FreeManagerData.
-        if let Err(e) = signal_event_group(boot_services, &DFCI_START_OF_BDS_NOTIFY_GUID) {
-            log::error!("signal gDfciStartOfBdsNotifyGuid failed: {:?}", e);
-        }
-
-        if let Err(e) = helpers::discover_console_devices(boot_services, runtime_services) {
-            log::error!("discover_console_devices failed: {:?}", e);
         }
 
         // Unified SRE hotkey dispatch. probe_sre_hotkey reads the latched
@@ -525,17 +500,11 @@ impl BootOrchestrator for SreBootManager {
                 }
             },
             SreHotkey::VolumeDown => {
-                if let Some(usb_path) = find_first_usb_block_io_device_path(boot_services) {
-                    log::info!("SRE hotkey: Vol-Down + USB present -> dispatching USB boot at {:?}", usb_path);
-                    if let Err(e) = helpers::signal_ready_to_boot(boot_services) {
-                        log::error!("signal_ready_to_boot (USB dispatch) failed: {:?}", e);
-                    }
-                    match helpers::boot_from_device_path(boot_services, image_handle, &usb_path) {
-                        Ok(()) => log::warn!("USB boot returned control; falling through to Boot####"),
-                        Err(e) => log::error!("USB boot_from_device_path failed: {:?}", e),
-                    }
-                } else if let Some(path) = &self.frontpage_app_path {
-                    log::info!("SRE hotkey: Vol-Down + no USB -> dispatching fallback app at {:?}", path);
+                // HARDCODED-BOOT TEST: skip USB enumeration entirely; go
+                // straight to the configured frontpage FvFile path. USB-first
+                // is a follow-up once the integration approach is settled.
+                if let Some(path) = &self.frontpage_app_path {
+                    log::info!("SRE hotkey: Vol-Down -> dispatching fallback app at {:?}", path);
                     if let Err(e) = helpers::signal_ready_to_boot(boot_services) {
                         log::error!("signal_ready_to_boot (fallback dispatch) failed: {:?}", e);
                     }
@@ -545,8 +514,7 @@ impl BootOrchestrator for SreBootManager {
                     }
                 } else {
                     log::warn!(
-                        "SRE hotkey: Vol-Down latched but no USB SimpleFileSystem handle present and no \
-                         frontpage_app_path configured; falling through"
+                        "SRE hotkey: Vol-Down latched but no frontpage_app_path configured; falling through"
                     );
                 }
             }
@@ -555,34 +523,15 @@ impl BootOrchestrator for SreBootManager {
             }
         }
 
-        // TODO(odp-platform-common#61): boot-partition write-lock helper isn't in
-        // patina_boot yet (PR #1488 closed; reopening planned). Skipping the lock
-        // for now — the SRE integrity guarantee requires this before shipping.
-        log::warn!(
-            "boot-partition write-lock skipped (issue #61 pending); target path = {:?}",
-            self.boot_partition_path
-        );
-
-        // Optional BP1 SRE WIM fallback. Probed once before Boot#### iteration
-        // so we can both filter USB entries (which would re-run the SRE
-        // flashing tool that committed the WIM) and dispatch run_sre_flow as
-        // the final fallback. Cost: one 512-byte LID 0x15 head read of BP1.
-        let bp_has_sre = self.bp_sre_fallback && bp_recovery::bp_has_valid_sre_wim(boot_services);
-
-        // Try boot options discovered from the firmware's Boot#### EFI variables.
-        // The constructor's `main_os_path` is used as a fallback when discovery
-        // either fails OR yields no entries (both leave `tried_any == false`).
+        // HARDCODED-BOOT TEST: also stripped out the bp_recovery BP1 SRE
+        // WIM probe + the USB-filter-on-Boot#### logic. Goes straight to
+        // Boot#### enumeration. NVMe LID reads are on PCIe (not I2C5) so
+        // safe in principle, but every extra protocol call before Windows
+        // boot is a thing to bisect later if lag persists.
         let mut tried_any = false;
         match helpers::discover_boot_options(runtime_services) {
             Ok(boot_config) => {
                 for device_path in boot_config.devices() {
-                    if bp_has_sre && device_path_has_usb_node(device_path) {
-                        log::info!(
-                            "Skipping USB Boot#### (BP1 has SRE WIM, fallback enabled); path={:?}",
-                            device_path
-                        );
-                        continue;
-                    }
                     tried_any = true;
                     if let Err(e) = helpers::signal_ready_to_boot(boot_services) {
                         log::error!("signal_ready_to_boot failed: {:?}", e);
@@ -608,20 +557,7 @@ impl BootOrchestrator for SreBootManager {
             }
         }
 
-        // Last-resort BP1 SRE fallback. Reached only if every Boot#### entry
-        // and the main_os_path either failed or were filtered. Boots the
-        // committed SRE WIM directly so a Windows-less device doesn't loop
-        // back to the USB flashing tool. Like other dispatch attempts in
-        // this function, a returning-control result falls through; only
-        // hard errors after this point reach the final `NotFound`.
-        if bp_has_sre {
-            log::info!("Normal boot exhausted; dispatching SRE from BP1");
-            match bp_recovery::run_sre_flow(boot_services, image_handle) {
-                Ok(()) => log::warn!("bp_recovery::run_sre_flow returned control; nothing left to try"),
-                Err(e) => log::error!("bp_recovery::run_sre_flow failed: {:?}", e),
-            }
-        }
-
+        // HARDCODED-BOOT TEST: BP1 SRE fallback removed for this run.
         log::error!("SRE normal boot exhausted all boot options");
         Err(EfiError::NotFound)
     }

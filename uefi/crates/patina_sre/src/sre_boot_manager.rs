@@ -432,6 +432,14 @@ impl BootOrchestrator for SreBootManager {
         dxe_dispatch: &dyn DxeDispatch,
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
+        // Identifies which build/code path this binary is running. Look
+        // for this line in serial logs to confirm the new patina_boot
+        // proxy + connect_all-fallback path is the one actually
+        // executing (vs. a cached older firmware).
+        log::info!(
+            "[SreBootManager] execute() entered: patina_boot proxy + connect_all-fallback path"
+        );
+
         // BDS sequence mirroring C BdsDxe + PlatformBootManagerLib on
         // Maa. All the EfiBootManager* primitives that previously had no
         // Rust equivalent now dispatch via patina_boot::proxy through
@@ -553,13 +561,16 @@ impl BootOrchestrator for SreBootManager {
             }
         }
 
-        // Iterate Boot#### options from NVRAM. NVMe + PartitionDxe were
-        // brought up at the top of execute(), so expand_device_path now
-        // finds the matching HD partition signature. For each option, do
-        // an additional TARGETED connect via helpers::connect_device_path
-        // (mirrors EDK2's EfiBootManagerConnectDevicePath) for any
-        // late-binding drivers along the specific path.
+        // Iterate Boot#### options from NVRAM. For each, try the
+        // narrow targeted connect first. If the boot attempt fails
+        // (typically expand_device_path NotFound because the partial
+        // HD(GPT,...) path can't be resolved against the topology),
+        // fall back to helpers::connect_all once and retry. This
+        // mirrors C BdsDxe's "ConnectAll as boot-failure fallback"
+        // pattern, gated to fire at most once per BDS invocation so
+        // the I2C5 driver's Start() doesn't get hammered repeatedly.
         let mut tried_any = false;
+        let mut connect_all_fallback_done = false;
         match helpers::discover_boot_options(runtime_services) {
             Ok(boot_config) => {
                 for device_path in boot_config.devices() {
@@ -571,8 +582,36 @@ impl BootOrchestrator for SreBootManager {
                         log::error!("signal_ready_to_boot failed: {:?}", e);
                     }
                     match helpers::boot_from_device_path(boot_services, image_handle, device_path) {
-                        Ok(()) => log::warn!("Boot option returned control (path={:?}), trying next...", device_path),
-                        Err(e) => log::warn!("Boot option failed (path={:?}): {:?}", device_path, e),
+                        Ok(()) => {
+                            log::warn!("Boot option returned control (path={:?}), trying next...", device_path);
+                        }
+                        Err(e) => {
+                            log::warn!("Boot option failed (path={:?}): {:?}", device_path, e);
+                            if !connect_all_fallback_done {
+                                log::info!(
+                                    "[SreBootManager] Falling back to helpers::connect_all to bring up unresolved topology"
+                                );
+                                if let Err(e2) = helpers::connect_all(boot_services) {
+                                    log::warn!("fallback connect_all failed: {:?}", e2);
+                                }
+                                connect_all_fallback_done = true;
+                                match helpers::boot_from_device_path(
+                                    boot_services,
+                                    image_handle,
+                                    device_path,
+                                ) {
+                                    Ok(()) => log::warn!(
+                                        "Boot option (after connect_all fallback) returned control (path={:?})",
+                                        device_path
+                                    ),
+                                    Err(e3) => log::warn!(
+                                        "Boot option still failed after connect_all fallback (path={:?}): {:?}",
+                                        device_path,
+                                        e3
+                                    ),
+                                }
+                            }
+                        }
                     }
                 }
             }

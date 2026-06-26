@@ -433,42 +433,52 @@ impl BootOrchestrator for SreBootManager {
         image_handle: efi::Handle,
     ) -> Result<!, EfiError> {
         // BDS sequence mirroring C BdsDxe + PlatformBootManagerLib on
-        // Maa, so platform EndOfDxe handlers (MU SemmManager checking
-        // DfciUiIsUiAvailable -> gMsSWMProtocolGuid) find what they need.
+        // Maa. All the EfiBootManager* primitives that previously had no
+        // Rust equivalent now dispatch via patina_boot::proxy through
+        // the PatinaBootMgrLibProxy DXE driver (a thin C shim that
+        // publishes UefiBootManagerLib + EndOfDxe primitives as a
+        // protocol vtable).
         //
-        //   1. Bootstrap PCI topology via ConnectRootBridge(FALSE).
-        //      PciBus enumerates the bus and creates handles for every
-        //      PCI device (display, NVMe, USB...). Without this all the
-        //      targeted-connect calls below are no-ops because their
-        //      target handles don't exist yet.
-        //   2. Connect default consoles so SimpleWindowManager publishes
-        //      gMsSWMProtocolGuid -> SemmManager's UI check passes at
-        //      EndOfDxe.
-        //   3. Connect NVMe -> namespace driver -> BlockIo ->
-        //      PartitionDxe -> HD child handles -> expand_device_path
-        //      finds the boot partition.
-        //   4. Signal EndOfDxe (security lockdown).
-        //
-        // Intentionally avoiding helpers::connect_all — it re-Start()s
-        // every driver binding, and the PTL I2C5 HID binding isn't
-        // idempotent (disable-poll race leaves bus stuck -> OS keyboard
-        // lag).
+        //   1. ConnectRootBridge(FALSE) — bootstrap PCI topology so
+        //      every downstream targeted-connect has handles to find.
+        //   2. DispatchDeferredImages — run DXE images flagged for
+        //      deferred dispatch (Surface networking, MM, etc.).
+        //   3. ConnectAllDefaultConsoles — drives ConSplitter, installs
+        //      gMsSWMProtocolGuid via SimpleWindowManagerDxe. Required
+        //      before EndOfDxe so SemmManager's DfciUiIsUiAvailable
+        //      check passes.
+        //   4. StartHotkeyService — install BDS hotkey listener (event
+        //      currently unused; future SRE hotkey integration).
+        //   5. EndOfDxe + InstallDxeSmmReadyToLock — security lockdown
+        //      chain (mirrors ExitPmAuth's two-step).
+        //   6. ProcessCapsules — apply firmware-update capsules staged
+        //      on the previous boot.
         if let Err(e) = helpers::connect_pci_root_bridges(boot_services) {
             log::warn!("connect_pci_root_bridges failed: {:?}", e);
         }
 
-        if let Err(e) = helpers::connect_default_consoles(boot_services) {
-            log::warn!("connect_default_consoles failed: {:?}", e);
+        if let Err(e) = patina_boot::proxy::dispatch_deferred_images(boot_services) {
+            log::warn!("proxy::dispatch_deferred_images failed: {:?}", e);
         }
 
-        const NVME_PASS_THRU_PROTOCOL_GUID: efi::Guid =
-            efi::Guid::from_fields(0x52c78312, 0x8edc, 0x4233, 0x98, 0xf2, &[0x1a, 0x1a, 0xa5, 0xe3, 0x88, 0xa5]);
-        if let Err(e) = helpers::connect_handles_by_protocol(boot_services, &NVME_PASS_THRU_PROTOCOL_GUID) {
-            log::warn!("connect_handles_by_protocol(NvmePassThru) failed: {:?}", e);
+        if let Err(e) = patina_boot::proxy::connect_all_default_consoles(boot_services) {
+            log::warn!("proxy::connect_all_default_consoles failed: {:?}", e);
+        }
+
+        if let Err(e) = patina_boot::proxy::start_hotkey_service(boot_services) {
+            log::warn!("proxy::start_hotkey_service failed: {:?}", e);
         }
 
         if let Err(e) = helpers::signal_bds_phase_entry(boot_services) {
             log::error!("signal_bds_phase_entry failed: {:?}", e);
+        }
+
+        if let Err(e) = patina_boot::proxy::install_dxe_smm_ready_to_lock(boot_services) {
+            log::warn!("proxy::install_dxe_smm_ready_to_lock failed: {:?}", e);
+        }
+
+        if let Err(e) = patina_boot::proxy::process_capsules(boot_services) {
+            log::warn!("proxy::process_capsules failed: {:?}", e);
         }
 
         // Unified SRE hotkey dispatch. probe_sre_hotkey reads the latched

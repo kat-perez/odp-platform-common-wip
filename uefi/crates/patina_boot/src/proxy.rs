@@ -124,13 +124,11 @@ pub fn connect_all_default_consoles<B: BootServices>(boot_services: &B) -> Resul
     check(boot_services, status)
 }
 
-/// Promote present-but-untested system memory to usable system memory,
-/// matching the C BDS's `BdsMemoryTest`. The DXE Core classifies
-/// system-memory HOBs that carry only `PRESENT`/`INITIALIZED` (not
-/// `TESTED`) attributes as `Reserved`, which the OS cannot use; on this
-/// platform that leaves the bulk of DRAM invisible to the OS. This drives
-/// `EFI_GENERIC_MEMORY_TEST_PROTOCOL` (from `NullMemoryTestDxe`) to
-/// convert those regions to `SystemMemory`.
+/// Promote present-but-untested system memory to usable system memory.
+/// The DXE Core classifies system-memory HOBs that carry only
+/// `PRESENT`/`INITIALIZED` (not `TESTED`) attributes as `Reserved`, which the
+/// OS cannot use. This drives `EFI_GENERIC_MEMORY_TEST_PROTOCOL` (from
+/// `NullMemoryTestDxe`) to convert those regions to `SystemMemory`.
 ///
 /// Requires proxy [`REVISION`] >= 0x0001_0001.
 pub fn perform_memory_test<B: BootServices>(boot_services: &B) -> Result<(), EfiError> {

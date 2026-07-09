@@ -15,13 +15,11 @@
 //!    → RAM disk → chainload); on a frontpage chord, try USB via live
 //!    `SimpleFileSystem` enumeration, then fall back to the configured
 //!    frontpage app
-//! 7. Write-lock the NVMe boot partition (volatile, until power cycle)
-//!    — currently a stub pending `patina_boot::partition` (odp-platform-common#61)
-//! 8. Enumerate firmware `Boot####` EFI variables via `discover_boot_options`
+//! 7. Enumerate firmware `Boot####` EFI variables via `discover_boot_options`
 //!    and try each in order: `signal_ready_to_boot` then `boot_from_device_path`
-//! 9. If discovery yields no entries or fails, fall back to the
+//! 8. If discovery yields no entries or fails, fall back to the
 //!    constructor-provided `main_os_path`
-//! 10. Return `EfiError::NotFound` if every boot attempt has been exhausted
+//! 9. Return `EfiError::NotFound` if every boot attempt has been exhausted
 //!
 //! Capsule-update orchestration is tracked separately and will layer on without
 //! changing the public constructor surface.
@@ -254,7 +252,6 @@ fn interleave_connect_and_dispatch<B: BootServices, D: DxeDispatch + ?Sized>(
 /// and capsule-update pre-boot hook will land in subsequent issues and
 /// extend this orchestrator without changing the public constructor surface.
 pub struct SreBootManager {
-    boot_partition_path: DevicePathBuf,
     main_os_path: DevicePathBuf,
     /// Optional FwFile device path for the SRE recovery app — dispatched
     /// when [`probe_sre_hotkey`] returns [`SreHotkey::VolumeUp`]. `None`
@@ -275,11 +272,9 @@ pub struct SreBootManager {
 }
 
 impl SreBootManager {
-    /// Construct an `SreBootManager` from the device paths of the boot partition
-    /// (to be write-locked before OS hand-off) and the main OS boot device.
-    pub fn new(boot_partition_path: DevicePathBuf, main_os_path: DevicePathBuf) -> Self {
+    /// Construct an `SreBootManager` from the main OS boot device path.
+    pub fn new(main_os_path: DevicePathBuf) -> Self {
         Self {
-            boot_partition_path,
             main_os_path,
             sre_app_path: None,
             frontpage_app_path: None,
@@ -634,14 +629,6 @@ impl BootOrchestrator for SreBootManager {
                 // Normal path — falls through to the existing Boot#### discovery below.
             }
         }
-
-        // TODO(odp-platform-common#61): boot-partition write-lock helper isn't in
-        // patina_boot yet (PR #1488 closed; reopening planned). Skipping the lock
-        // for now — the SRE integrity guarantee requires this before shipping.
-        log::warn!(
-            "boot-partition write-lock skipped (issue #61 pending); target path = {:?}",
-            self.boot_partition_path
-        );
 
         // Optional BP1 SRE WIM fallback. Probed once before Boot#### iteration
         // so we can both filter USB entries (which would re-run the SRE

@@ -269,6 +269,15 @@ pub struct SreBootManager {
     ///     before returning [`EfiError::NotFound`].
     /// Default `false`. Platforms opt in via [`Self::with_bp_sre_fallback`].
     bp_sre_fallback: bool,
+    /// When `true`, `execute()` signals `gDfciStartOfBdsNotifyGuid` so the MU
+    /// `SettingsManagerDxe` publishes `gDfciSettingAccessProtocolGuid` and the
+    /// DFCI/SEMM mailbox processing (`VerifyPolicyAndChange`) runs. Requires
+    /// the Variable Policy protocol, which the Patina DXE Core does not yet
+    /// publish (patina #466); without it `SettingsManagerDxe` never dispatches,
+    /// so the signal only wakes SEMM's `VerifyPolicyAndChange` into an absent
+    /// SettingAccess protocol. Default `false`. Platforms with a working DFCI
+    /// stack opt in via [`Self::with_dfci_bds_signal`].
+    dfci_bds_signal: bool,
 }
 
 impl SreBootManager {
@@ -279,6 +288,7 @@ impl SreBootManager {
             sre_app_path: None,
             frontpage_app_path: None,
             bp_sre_fallback: false,
+            dfci_bds_signal: false,
         }
     }
 
@@ -324,6 +334,16 @@ impl SreBootManager {
     /// commits the SRE WIM via Firmware Image Download to BP1.
     pub fn with_bp_sre_fallback(mut self) -> Self {
         self.bp_sre_fallback = true;
+        self
+    }
+
+    /// Opt into signaling `gDfciStartOfBdsNotifyGuid` during [`Self::execute`].
+    /// Leave off on Patina platforms until the Variable Policy protocol is
+    /// available (patina #466); signaling it there only drives SEMM's
+    /// `VerifyPolicyAndChange` into an unpublished SettingAccess protocol,
+    /// which faults or resets at EndOfDxe. Default off.
+    pub fn with_dfci_bds_signal(mut self) -> Self {
+        self.dfci_bds_signal = true;
         self
     }
 }
@@ -532,13 +552,15 @@ impl BootOrchestrator for SreBootManager {
         // inside the callback, which would corrupt the EDK2 DxeCore notify
         // iterator if fired while EndOfDxe were still iterating.
         //
-        // Safe to signal because the upstream DfciManager is dispatch-order
-        // resilient: apply-protocol statics are populated via
-        // RegisterProtocolNotify (so they're non-NULL whenever
-        // ProcessMailBoxes runs), and ProcessMailBoxes has a top-of-function
-        // guard against re-entry after FreeManagerData.
-        if let Err(e) = signal_event_group(boot_services, &DFCI_START_OF_BDS_NOTIFY_GUID) {
-            log::error!("signal gDfciStartOfBdsNotifyGuid failed: {:?}", e);
+        // Gated behind with_dfci_bds_signal(): under Patina the Variable Policy
+        // protocol is unavailable (patina #466), so SettingsManagerDxe never
+        // dispatches and this signal only drives SEMM's VerifyPolicyAndChange
+        // into an absent SettingAccess protocol, faulting/resetting at
+        // EndOfDxe. Enabled only where the DFCI stack is fully functional.
+        if self.dfci_bds_signal {
+            if let Err(e) = signal_event_group(boot_services, &DFCI_START_OF_BDS_NOTIFY_GUID) {
+                log::error!("signal gDfciStartOfBdsNotifyGuid failed: {:?}", e);
+            }
         }
 
         if let Err(e) = helpers::discover_console_devices(boot_services, runtime_services) {

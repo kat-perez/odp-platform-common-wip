@@ -30,7 +30,7 @@ pub const PROTOCOL_GUID: efi::Guid =
 /// Current revision. Bump in lockstep with the C header when the
 /// vtable layout changes; consumers should refuse to dispatch if the
 /// major revision doesn't match.
-pub const REVISION: u32 = 0x0001_0001;
+pub const REVISION: u32 = 0x0001_0002;
 
 /// Mirrors EDK2's `CONSOLE_TYPE` enum (UefiBootManagerLib).
 #[repr(u32)]
@@ -68,6 +68,11 @@ pub struct Protocol {
     /// by the DXE Core) to usable system memory via
     /// `EFI_GENERIC_MEMORY_TEST_PROTOCOL`. Added in revision 0x0001_0001.
     pub perform_memory_test: unsafe extern "efiapi" fn() -> efi::Status,
+    /// Draw the OEM system boot logo and register its location with the Boot
+    /// Logo protocol (`BootGraphicsLib::DisplayBootGraphic(BG_SYSTEM_LOGO)`) so
+    /// `DisplayUpdateProgress` can render the firmware-update progress bar.
+    /// Requires GOP connected. Added in revision 0x0001_0002.
+    pub display_boot_logo: unsafe extern "efiapi" fn() -> efi::Status,
 }
 
 /// Locate the proxy protocol and return a borrowed reference. Returns
@@ -139,6 +144,23 @@ pub fn perform_memory_test<B: BootServices>(boot_services: &B) -> Result<(), Efi
         return Err(EfiError::Unsupported);
     }
     let status = unsafe { (proxy.perform_memory_test)() };
+    check(boot_services, status)
+}
+
+/// Draw the OEM system boot logo and register its location with the Boot Logo
+/// protocol (`BootGraphicsLib::DisplayBootGraphic(BG_SYSTEM_LOGO)`), so that
+/// `DisplayUpdateProgress` can render the firmware-update progress bar during
+/// capsule processing. Call after controllers are connected (GOP present).
+///
+/// Requires proxy [`REVISION`] >= 0x0001_0002.
+pub fn display_boot_logo<B: BootServices>(boot_services: &B) -> Result<(), EfiError> {
+    let proxy = locate(boot_services)?;
+    if proxy.revision < 0x0001_0002 {
+        // Older proxy driver without the boot-logo entry; skip rather than
+        // dispatch through an out-of-bounds vtable slot.
+        return Err(EfiError::Unsupported);
+    }
+    let status = unsafe { (proxy.display_boot_logo)() };
     check(boot_services, status)
 }
 
